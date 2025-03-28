@@ -1,0 +1,297 @@
+# Core libraries
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+
+# TensorFlow and Keras
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import (
+    Conv2D, MaxPooling2D, Dense, Flatten, 
+    Dropout, BatchNormalization
+)
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import (
+    TensorBoard, EarlyStopping, ReduceLROnPlateau
+)
+from tensorflow.keras.metrics import Precision, Recall, CategoricalAccuracy
+from sklearn.metrics import confusion_matrix, classification_report
+import seaborn as sns
+
+# Configuration
+RANDOM_SEED = 42
+IMAGE_SIZE = (48, 48)  # FER-2013 images are 48x48 pixels
+IMAGE_CHANNELS = 1     # Grayscale images
+BATCH_SIZE = 64
+EPOCHS = 20
+DATA_DIR = "fer2013"   # Path to your extracted dataset
+
+# All emotion classes in FER-2013
+EMOTIONS = {
+    0: 'angry',
+    1: 'disgust',
+    2: 'fear',
+    3: 'happy',
+    4: 'neutral',
+    5: 'sad',
+    6: 'surprise'
+}
+NUM_CLASSES = len(EMOTIONS)
+
+# Set random seeds for reproducibility
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+
+def prepare_data(data_dir):
+    """
+    Prepare the data generators for training and validation.
+    Uses all emotion classes from the FER-2013 dataset.
+    """
+    # Path to the main directory containing train and test folders
+    train_dir = os.path.join(data_dir, "train")
+    test_dir = os.path.join(data_dir, "test")
+    
+    # Create data generators with augmentation for training
+    train_datagen = ImageDataGenerator(
+        rescale=1./255,
+        rotation_range=15,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        shear_range=0.1,
+        zoom_range=0.1,
+        horizontal_flip=True,
+        fill_mode='nearest',
+        validation_split=0.2  # Using 20% for validation
+    )
+    
+    # Validation data generator (only rescaling)
+    val_datagen = ImageDataGenerator(
+        rescale=1./255,
+        validation_split=0.2
+    )
+    
+    # Test data generator (only rescaling)
+    test_datagen = ImageDataGenerator(rescale=1./255)
+    
+    # Create generators for all emotion classes
+    train_generator = train_datagen.flow_from_directory(
+        train_dir,
+        target_size=IMAGE_SIZE,
+        color_mode='grayscale',
+        batch_size=BATCH_SIZE,
+        class_mode='categorical',
+        subset='training',
+        seed=RANDOM_SEED
+    )
+    
+    val_generator = train_datagen.flow_from_directory(
+        train_dir,
+        target_size=IMAGE_SIZE,
+        color_mode='grayscale',
+        batch_size=BATCH_SIZE,
+        class_mode='categorical',
+        subset='validation',
+        seed=RANDOM_SEED
+    )
+    
+    test_generator = test_datagen.flow_from_directory(
+        test_dir,
+        target_size=IMAGE_SIZE,
+        color_mode='grayscale',
+        batch_size=BATCH_SIZE,
+        class_mode='categorical',
+        shuffle=False
+    )
+    
+    # Print class indices to verify correct mapping
+    print("Class indices:", train_generator.class_indices)
+    
+    return train_generator, val_generator, test_generator
+
+def build_model(input_shape=(*IMAGE_SIZE, IMAGE_CHANNELS)):
+    """
+    Build a CNN model for multi-class emotion classification.
+    """
+    model = Sequential([
+        # First convolutional block
+        Conv2D(64, (3, 3), activation='relu', padding='same', input_shape=input_shape),
+        BatchNormalization(),
+        Conv2D(64, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        MaxPooling2D((2, 2)),
+        Dropout(0.25),
+        
+        # Second convolutional block
+        Conv2D(128, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        Conv2D(128, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        MaxPooling2D((2, 2)),
+        Dropout(0.25),
+        
+        # Third convolutional block
+        Conv2D(256, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        Conv2D(256, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        MaxPooling2D((2, 2)),
+        Dropout(0.25),
+        
+        # Flatten and dense layers
+        Flatten(),
+        Dense(512, activation='relu'),
+        BatchNormalization(),
+        Dropout(0.5),
+        Dense(NUM_CLASSES, activation='softmax')
+    ])
+    
+    # Compile the model
+    model.compile(
+        optimizer=Adam(learning_rate=0.0001),
+        loss='categorical_crossentropy',
+        metrics=['accuracy', Precision(), Recall(), CategoricalAccuracy()]
+    )
+    
+    return model
+
+def train_model(model, train_data, val_data, epochs=EPOCHS):
+    """
+    Train the model with callbacks.
+    """
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=5, min_lr=1e-7),
+        TensorBoard(log_dir='./logs')
+    ]
+    
+    history = model.fit(
+        train_data,
+        validation_data=val_data,
+        epochs=epochs,
+        callbacks=callbacks
+    )
+    
+    return history
+
+def evaluate_model(model, test_generator):
+    """
+    Evaluate the model on test data and show metrics.
+    """
+    # Reset the test generator to ensure we process all samples
+    test_generator.reset()
+    
+    # Get predictions for all samples
+    y_pred = model.predict(test_generator, verbose=1)
+    y_pred_classes = np.argmax(y_pred, axis=1)
+    y_true = test_generator.classes
+    
+    # Ensure we only consider the samples that were actually predicted
+    y_true = y_true[:len(y_pred_classes)]
+    
+    # Classification report
+    print("\nClassification Report:")
+    print(classification_report(y_true, y_pred_classes, target_names=list(EMOTIONS.values())))
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred_classes)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=EMOTIONS.values(), yticklabels=EMOTIONS.values())
+    plt.title('Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.show()
+    
+    # Calculate and display additional metrics
+    test_loss, test_acc, test_precision, test_recall, _ = model.evaluate(test_generator)
+    print(f"\nTest Accuracy: {test_acc:.4f}")
+    print(f"Test Precision: {test_precision:.4f}")
+    print(f"Test Recall: {test_recall:.4f}")
+
+def plot_training_history(history):
+    """
+    Plot training and validation metrics.
+    """
+    plt.figure(figsize=(12, 5))
+    
+    # Plot training & validation accuracy values
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['accuracy'])
+    plt.plot(history.history['val_accuracy'])
+    plt.title('Model Accuracy')
+    plt.ylabel('Accuracy')
+    plt.xlabel('Epoch')
+    plt.legend(['Train', 'Validation'], loc='upper left')
+    
+    # Plot training & validation loss values
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['loss'])
+    plt.plot(history.history['val_loss'])
+    plt.title('Model Loss')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend(['Train', 'Validation'], loc='upper left')
+    
+    plt.tight_layout()
+    plt.show()
+
+def predict_emotion(model, image_path):
+    """
+    Predict emotion from a single image.
+    """
+    # Load and preprocess the image
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        print("Error: Could not read image")
+        return
+    
+    img = cv2.resize(img, IMAGE_SIZE)
+    img = img / 255.0
+    img = np.expand_dims(img, axis=(0, -1))  # Add batch and channel dimensions
+    
+    # Make prediction
+    predictions = model.predict(img)[0]
+    predicted_class = np.argmax(predictions)
+    emotion = EMOTIONS[predicted_class]
+    confidence = predictions[predicted_class]
+    
+    # Display the image with prediction
+    plt.imshow(img[0, :, :, 0], cmap='gray')
+    plt.title(f"Predicted: {emotion} ({confidence*100:.2f}% confidence)")
+    plt.axis('off')
+    plt.show()
+    
+    # Print all probabilities
+    print("\nPrediction Probabilities:")
+    for i, prob in enumerate(predictions):
+        print(f"{EMOTIONS[i]}: {prob*100:.2f}%")
+    
+    return emotion, confidence
+
+def main():
+    # Prepare data generators
+    train_generator, val_generator, test_generator = prepare_data(DATA_DIR)
+    
+    # Build the model
+    model = build_model()
+    model.summary()
+    
+    # Train the model
+    history = train_model(model, train_generator, val_generator)
+    
+    # Plot training history
+    plot_training_history(history)
+    
+    # Evaluate on test set
+    evaluate_model(model, test_generator)
+    
+    # Save the model
+    model.save('emotion_classifier_multi.h5')
+    
+    # Example prediction (replace with path to your test image)
+    # predict_emotion(model, "path_to_test_image.jpg")
+
+if __name__ == "__main__":
+    main()
